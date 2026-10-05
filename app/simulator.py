@@ -29,6 +29,10 @@ class Version:
     kind: str  # initial | uncommitted | committed | aborted
     writer: str  # "INIT" 或事务名
     wseq: Optional[int]  # WRITE 操作的全局序号
+    # COMMIT 操作的全局序号（仅内部使用，不随响应输出）：
+    # 初始版本为 0；未提交/已回滚为 None。版本链按写入顺序排列，
+    # 而“最新已提交”按 cseq（提交顺序）判定——先写者可以晚提交。
+    cseq: Optional[int] = None
 
 
 @dataclass
@@ -172,16 +176,23 @@ def build_schedule(txns: List[Txn]) -> List[Tuple[str, Tuple[str, Optional[str],
 
 
 def _initial_version(vid: int, key: str, value: Any) -> Version:
-    return Version(vid=vid, key=key, value=value, kind="initial", writer="INIT", wseq=None)
+    return Version(vid=vid, key=key, value=value, kind="initial",
+                   writer="INIT", wseq=None, cseq=0)
 
 
 def _snapshot(chains: Dict[str, List[Version]]) -> Dict[str, Version]:
+    # “最新已提交”按提交顺序（cseq）判定，而非版本链的写入顺序：
+    # 先写的事务可以更晚提交，晚提交者才是当前已提交版本。
     snap: Dict[str, Version] = {}
     for key, chain in chains.items():
-        for v in reversed(chain):
-            if v.kind == "committed" or v.kind == "initial":
-                snap[key] = v
-                break
+        best: Optional[Version] = None
+        for v in chain:
+            if v.kind not in ("committed", "initial"):
+                continue
+            if best is None or (v.cseq, v.wseq or -1) > (best.cseq, best.wseq or -1):
+                best = v
+        if best is not None:
+            snap[key] = best
     return snap
 
 
@@ -216,11 +227,18 @@ def _ru_latest_visible(chains: Dict[str, List[Version]], key: str, current_txn: 
 
 
 def _rc_latest(chains: Dict[str, List[Version]], key: str) -> Optional[Version]:
-    """RC：最新已提交版本（未提交的自己写的版本在 RC 下也不可见）。"""
-    for v in reversed(chains.get(key, [])):
-        if v.kind in ("committed", "initial"):
-            return v
-    return None
+    """RC：最新已提交版本——按提交顺序（cseq）取，而非按写入顺序取链尾。
+
+    同键交错提交（先写者晚提交）时，晚提交的版本即使 vid 较小也是最新；
+    未提交（含本事务自己写的）与已回滚版本一律不可见。
+    """
+    best: Optional[Version] = None
+    for v in chains.get(key, []):
+        if v.kind not in ("committed", "initial"):
+            continue
+        if best is None or (v.cseq, v.wseq or -1) > (best.cseq, best.wseq or -1):
+            best = v
+    return best
 
 
 def _si_read(t: Txn, chains: Dict[str, List[Version]], key: str) -> Tuple[Optional[Version], str]:
@@ -378,8 +396,8 @@ def simulate(mode: str,
             elif source == "snapshot":
                 newer = [
                     v for v in chains[key]
-                    if v.kind == "committed" and v.vid != chosen.vid
-                    and v.vid > chosen.vid
+                    if v.kind == "committed" and v is not chosen
+                    and v.cseq > chosen.cseq
                 ]
                 extra = ""
                 if newer:
@@ -419,12 +437,13 @@ def simulate(mode: str,
 
             if mode == "SI":
                 # 首提交者胜：快照之后，若本事务写过的键已有其他事务提交新版本，
-                # 则整笔回滚。
+                # 则整笔回滚。按提交顺序（cseq）判定：先写晚提交者同样会冲突；
+                # 快照中不存在的键视为初始版本（cseq=0）。
                 conflict = None
                 for wkey, _wseq in t.writes:
-                    snap_vid = t.snapshot[wkey].vid if wkey in t.snapshot else None
+                    snap_cseq = t.snapshot[wkey].cseq if wkey in t.snapshot else 0
                     for v in chains[wkey]:
-                        if v.kind == "committed" and v.vid != snap_vid:
+                        if v.kind == "committed" and v.cseq > snap_cseq:
                             conflict = (wkey, v)
                             break
                     if conflict:
@@ -451,6 +470,7 @@ def simulate(mode: str,
                         for v in chains[wkey]:
                             if v.wseq == wseq:
                                 v.kind = "committed"
+                                v.cseq = seq
                     step["txn_status_after"] = "committed"
                     step["info"] = f"提交成功，{len(t.writes)} 个写入转为已提交版本"
             else:
@@ -459,6 +479,7 @@ def simulate(mode: str,
                     for v in chains[wkey]:
                         if v.wseq == wseq:
                             v.kind = "committed"
+                            v.cseq = seq
                 step["txn_status_after"] = "committed"
                 step["info"] = f"提交成功，{len(t.writes)} 个写入转为已提交版本"
 
@@ -615,10 +636,13 @@ def _build_graph(txn_list: List[Txn], chains: Dict[str, List[Version]]) -> dict:
             # WR（读己之写不算）：读到别人已提交版本
             if rv.writer != "INIT" and rv.writer != t.name and rv.writer in committed:
                 add_edge("WR", rv.writer, t.name, key, rseq, rv.wseq)
-            # RW 反依赖：读之后，同一键有别的已提交事务写入了更新版本
+            # RW 反依赖：该读发生之后，同一键才有别的已提交事务提交的新版本
+            # （按提交序号 cseq 判定，而非版本编号 vid）。版本链按写入顺序排列，
+            # 若写入者虽在链上更“新”却在读之前就已提交（先写晚提交场景中
+            # 编号更大的版本可能先提交），则不构成读后写反依赖。
             for v in chains.get(key, []):
                 if (v.kind == "committed" and v.writer in committed
-                        and v.writer != t.name and v.vid > rv.vid):
+                        and v.writer != t.name and v.cseq > rseq):
                     add_edge("RW", t.name, v.writer, key, rseq, v.wseq)
 
     # WW：同一键上先后写入并都提交的两个事务（按版本链顺序）

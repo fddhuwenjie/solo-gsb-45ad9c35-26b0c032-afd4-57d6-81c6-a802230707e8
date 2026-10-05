@@ -312,6 +312,17 @@ const EXAMPLES = [
       "BEGIN\nREAD x\nWRITE y 0\nCOMMIT",
       "BEGIN\nREAD y\nWRITE x 0\nCOMMIT"
     ]
+  },
+  {
+    name: "示例4 · 同键交错提交",
+    desc: "T1 先写 x=1 却晚于写 x=2 的 T2 提交，T3 在两次提交之后读 x：RC 按提交顺序读到 T1 的 1（而非编号更大的 T2 的 2），RU 取最新写入 2，SI 读 BEGIN 快照 0 且 T1 同键冲突整笔回滚。",
+    initial: "x=0\na=0\nb=0\nc=0",
+    enableT3: true,
+    txns: [
+      "BEGIN\nWRITE x 1\nREAD a\nCOMMIT",
+      "BEGIN\nWRITE x 2\nCOMMIT",
+      "BEGIN\nREAD b\nREAD c\nREAD x\nCOMMIT"
+    ]
   }
 ];
 
