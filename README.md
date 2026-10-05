@@ -1,0 +1,85 @@
+# 事务交错推演（Transaction Interleaving Playground）
+
+用 Python + FastAPI + 原生 HTML/CSS/JavaScript 构建的事务调度可视化网页：
+编辑初始键值与 2～3 条事务脚本，系统按**轮转调度**（依次从各事务队头取操作）
+排出同一份全局调度，再分别在三种隔离级别下生成确定性轨迹并逐步展示。
+
+## 隔离级别语义
+
+| 隔离级别 | 读取规则 |
+|---|---|
+| **Read Uncommitted (RU)** | 读键上的**最新写入**，包括其他事务尚未提交的版本；写入方若随后 ABORT，该读列入「脏读清单」 |
+| **Read Committed (RC)** | 每次读只取键上的**最新已提交版本**（不读未提交数据，亦不看自身未提交的写） |
+| **Snapshot Isolation (SI)** | 读 **BEGIN 时的快照**，自身写入优先；BEGIN 之后同键若已被其他事务提交，提交时按**首提交者胜**整笔回滚 |
+
+页面支持：
+
+- 逐步 / 自动播放每一条调度操作，展示**读值、来源版本、写入者**与逐条解释；
+- 每一步刷新**版本链**（初始 / 未提交 / 已提交 / 已回滚版本，读写位置高亮）与事务状态；
+- 按**已提交事务的真实读写关系**生成三种依赖边：
+  - `WR`：Tj 读到 Ti 已提交版本（Ti → Tj）；
+  - `WW`：同键上 Ti 先写、Tj 后写且均提交（Ti → Tj）；
+  - `RW`（反依赖）：Ti 读过某版本后，同键出现 Tj 的更新已提交版本（Ti → Tj）；
+  - 图中发现环时，环上的边与对应的读/写操作红色高亮；
+- 单列「**脏读清单**」：读到后来被 ABORT 的未提交数据；
+- 内置三个一键加载示例：脏读、丢失更新（对比 RC 提交成环与 SI 回滚）、写偏序（SI 下双双提交但 RW 成环）。
+
+## 事务脚本语法
+
+每条脚本一行，仅允许以下操作（大小写不敏感）：
+
+```
+BEGIN
+READ key
+WRITE key value
+COMMIT
+ABORT
+```
+
+- 必须以 `BEGIN` 开头，以 `COMMIT` 或 `ABORT` 结尾，结束语句之后不能再有操作；
+- 值支持整数、小数、`true` / `false` / `null` 与字符串；
+- 初始键值每行一个 `key=value`；
+- 勾选「启用 T3」可使用 3 条事务。
+
+## 一键启动（Docker Compose）
+
+```bash
+docker compose up --build
+```
+
+启动后访问：
+
+- **http://localhost:8000** —— 推演网页
+- http://localhost:8000/api/health —— 健康检查
+
+后台停止：`docker compose down`。
+
+## 本地直接运行（可选，无需 Docker）
+
+需要 Python 3.11+：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+然后访问 http://localhost:8000 。
+
+## 接口
+
+`POST /api/simulate`
+
+```json
+{
+  "initial": "x=0\ny=0",
+  "txns": [
+    "BEGIN\nREAD x\nWRITE x 10\nCOMMIT",
+    "BEGIN\nREAD x\nWRITE x 20\nCOMMIT"
+  ]
+}
+```
+
+返回三种隔离级别各自的 `steps`（含每步版本链快照、读值来源、事务状态）、
+`dirty_reads` 与 `graph`（节点 / WR·WW·RW 边 / 环路径）。
