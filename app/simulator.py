@@ -29,6 +29,7 @@ class Version:
     kind: str  # initial | uncommitted | committed | aborted
     writer: str  # "INIT" 或事务名
     wseq: Optional[int]  # WRITE 操作的全局序号
+    cseq: Optional[int] = None  # COMMIT 操作的全局序号；初始版本记 0，未提交/已回滚为 None
 
 
 @dataclass
@@ -172,16 +173,22 @@ def build_schedule(txns: List[Txn]) -> List[Tuple[str, Tuple[str, Optional[str],
 
 
 def _initial_version(vid: int, key: str, value: Any) -> Version:
-    return Version(vid=vid, key=key, value=value, kind="initial", writer="INIT", wseq=None)
+    return Version(vid=vid, key=key, value=value, kind="initial",
+                   writer="INIT", wseq=None, cseq=0)
 
 
 def _snapshot(chains: Dict[str, List[Version]]) -> Dict[str, Version]:
+    # 快照取每个键上“最后提交”的版本：以提交时刻 cseq 为准，
+    # 与版本在链上的位置（写入顺序）无关，因此交错提交也能取对。
     snap: Dict[str, Version] = {}
     for key, chain in chains.items():
-        for v in reversed(chain):
-            if v.kind == "committed" or v.kind == "initial":
-                snap[key] = v
-                break
+        best: Optional[Version] = None
+        for v in chain:
+            if v.kind in ("committed", "initial"):
+                if best is None or (v.cseq or 0) >= (best.cseq or 0):
+                    best = v
+        if best is not None:
+            snap[key] = best
     return snap
 
 
@@ -216,11 +223,19 @@ def _ru_latest_visible(chains: Dict[str, List[Version]], key: str, current_txn: 
 
 
 def _rc_latest(chains: Dict[str, List[Version]], key: str) -> Optional[Version]:
-    """RC：最新已提交版本（未提交的自己写的版本在 RC 下也不可见）。"""
-    for v in reversed(chains.get(key, [])):
+    """RC：最新已提交版本。
+
+    “最新”按提交时刻 cseq 判定，而非版本在链上的位置（写入顺序）：
+    先写后提交的版本也可能是当前最新版本。cseq 相同（同一事务的多个版本
+    一次提交）时取链上靠后的；未提交与已回滚版本一律不可见
+    （RC 不读未提交，也读不到回滚之后的写入）。
+    """
+    best: Optional[Version] = None
+    for v in chains.get(key, []):
         if v.kind in ("committed", "initial"):
-            return v
-    return None
+            if best is None or (v.cseq or 0) >= (best.cseq or 0):
+                best = v
+    return best
 
 
 def _si_read(t: Txn, chains: Dict[str, List[Version]], key: str) -> Tuple[Optional[Version], str]:
@@ -238,7 +253,7 @@ def _chain_dicts(chains: Dict[str, List[Version]]) -> "OrderedDict[str, List[dic
     for key, chain in chains.items():
         out[key] = [
             {"vid": v.vid, "value": v.value, "kind": v.kind, "writer": v.writer,
-             "wseq": v.wseq}
+             "wseq": v.wseq, "cseq": v.cseq}
             for v in chain
         ]
     return out
@@ -246,7 +261,8 @@ def _chain_dicts(chains: Dict[str, List[Version]]) -> "OrderedDict[str, List[dic
 
 def _snapshot_dict(t: Txn) -> Dict[str, dict]:
     return {
-        k: {"vid": v.vid, "value": v.value, "writer": v.writer, "wseq": v.wseq}
+        k: {"vid": v.vid, "value": v.value, "writer": v.writer,
+            "wseq": v.wseq, "cseq": v.cseq}
         for k, v in t.snapshot.items()
     }
 
@@ -376,10 +392,11 @@ def simulate(mode: str,
                     f"{_fmt(chosen.value)}"
                 )
             elif source == "snapshot":
+                snap_cseq = chosen.cseq or 0
                 newer = [
                     v for v in chains[key]
                     if v.kind == "committed" and v.vid != chosen.vid
-                    and v.vid > chosen.vid
+                    and (v.cseq or 0) > snap_cseq
                 ]
                 extra = ""
                 if newer:
@@ -418,13 +435,14 @@ def simulate(mode: str,
             t.commit_seq = seq
 
             if mode == "SI":
-                # 首提交者胜：快照之后，若本事务写过的键已有其他事务提交新版本，
-                # 则整笔回滚。
+                # 首提交者胜：BEGIN 快照之后，若本事务写过的键已有其他事务
+                # 提交新版本（以提交时刻 cseq 为准，与版本链位置无关），则整笔回滚。
                 conflict = None
                 for wkey, _wseq in t.writes:
                     snap_vid = t.snapshot[wkey].vid if wkey in t.snapshot else None
                     for v in chains[wkey]:
-                        if v.kind == "committed" and v.vid != snap_vid:
+                        if (v.kind == "committed" and v.vid != snap_vid
+                                and (v.cseq or 0) > (t.begin_seq or 0)):
                             conflict = (wkey, v)
                             break
                     if conflict:
@@ -451,6 +469,7 @@ def simulate(mode: str,
                         for v in chains[wkey]:
                             if v.wseq == wseq:
                                 v.kind = "committed"
+                                v.cseq = seq
                     step["txn_status_after"] = "committed"
                     step["info"] = f"提交成功，{len(t.writes)} 个写入转为已提交版本"
             else:
@@ -459,6 +478,7 @@ def simulate(mode: str,
                     for v in chains[wkey]:
                         if v.wseq == wseq:
                             v.kind = "committed"
+                            v.cseq = seq
                 step["txn_status_after"] = "committed"
                 step["info"] = f"提交成功，{len(t.writes)} 个写入转为已提交版本"
 
@@ -615,10 +635,13 @@ def _build_graph(txn_list: List[Txn], chains: Dict[str, List[Version]]) -> dict:
             # WR（读己之写不算）：读到别人已提交版本
             if rv.writer != "INIT" and rv.writer != t.name and rv.writer in committed:
                 add_edge("WR", rv.writer, t.name, key, rseq, rv.wseq)
-            # RW 反依赖：读之后，同一键有别的已提交事务写入了更新版本
+            # RW 反依赖：读到版本之后，同一键才由别的事务提交更新版本。
+            # 必须按提交时刻判定（cseq > 读操作序号），不能按版本编号/链位置：
+            # 先写后提交的版本虽然 vid 较大，但若在读之前已提交，读者本就能读到，
+            # 并不构成反依赖（例如交错提交后读到“最后提交”版本的情形）。
             for v in chains.get(key, []):
                 if (v.kind == "committed" and v.writer in committed
-                        and v.writer != t.name and v.vid > rv.vid):
+                        and v.writer != t.name and (v.cseq or 0) > rseq):
                     add_edge("RW", t.name, v.writer, key, rseq, v.wseq)
 
     # WW：同一键上先后写入并都提交的两个事务（按版本链顺序）

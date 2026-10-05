@@ -312,6 +312,17 @@ const EXAMPLES = [
       "BEGIN\nREAD x\nWRITE y 0\nCOMMIT",
       "BEGIN\nREAD y\nWRITE x 0\nCOMMIT"
     ]
+  },
+  {
+    name: "示例4 · 同键交错提交",
+    desc: "T1 先写 x=1 却晚于写 x=2 的 T2 提交；之后 T3 读 x：RC 按提交时刻取最后提交的 T1=1，版本链仍保持写入顺序；RU 取最新写入 2，SI 读 BEGIN 快照 0 且 T1 冲突回滚。",
+    initial: "x=0\ny=0",
+    enableT3: true,
+    txns: [
+      "BEGIN\nWRITE x 1\nREAD y\nCOMMIT",
+      "BEGIN\nWRITE x 2\nCOMMIT",
+      "BEGIN\nREAD y\nREAD y\nREAD x\nCOMMIT"
+    ]
   }
 ];
 
@@ -547,11 +558,12 @@ function renderChains(step) {
       if (v.vid === step.new_vid) { hl = " hl-write"; ring = `<span class="ring-label write">写</span>`; }
       if (v.vid === step.conflict_vid) { hl = " hl-conflict"; ring = `<span class="ring-label conflict">冲突</span>`; }
       const kindLabel = { initial: "初始", uncommitted: "未提交", committed: "已提交", aborted: "已回滚" }[v.kind];
+      const cseqLabel = v.kind === "committed" ? ` · 提交#${v.cseq}` : "";
       html += `<div class="vbadge ${v.kind}${hl}">
         ${ring}
         <div class="vid">v${v.vid}</div>
         <div class="vval">${esc(fmt(v.value))}</div>
-        <div class="vmeta">${v.writer === "INIT" ? "INIT" : esc(v.writer)} · ${kindLabel}</div>
+        <div class="vmeta">${v.writer === "INIT" ? "INIT" : esc(v.writer)} · ${kindLabel}${cseqLabel}</div>
       </div>`;
     });
     html += `</div></div>`;
